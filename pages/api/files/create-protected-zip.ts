@@ -1,12 +1,8 @@
+// pages/api/files/create-protected-zip.ts
 import { NextApiRequest, NextApiResponse } from 'next';
 import JSZip from 'jszip';
+import CryptoJS from 'crypto-js';
 import { supabase } from '@/lib/supabase';
-
-interface FileData {
-  name: string;
-  type: string;
-  data: string;
-}
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') {
@@ -30,30 +26,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     }
 
-    console.log(`Creating ZIP for user ${userId} with ${files.length} files`);
+    console.log(`Creating encrypted ZIP for user ${userId} with ${files.length} files`);
 
-    // Usar el mismo bucket que en tu otro proyecto
     const bucketName = "llakaScriptBucket";
     const userFolder = `user-${userId}`;
-    const fullPath = userFolder;
+    const timestamp = Date.now();
+    const zipFileName = `protected-${timestamp}.zip`;
+    const filePath = `${userFolder}/${zipFileName}`;
 
-    // Verificar/Crear la carpeta del usuario (similar a tu otro proyecto)
-    try {
-      await supabase.storage
-        .from(bucketName)
-        .upload(`${fullPath}/.keep`, new Blob([]), { upsert: true });
-    } catch (folderError) {
-      console.log('Folder check completed');
-    }
-
-    // Crear ZIP con JSZip
+    // Paso 1: Crear ZIP normal
     const zip = new JSZip();
 
     // Agregar archivos al ZIP
     for (const file of files) {
       if (file?.name && file?.data) {
         try {
-          // Convertir base64 a ArrayBuffer
           const binaryString = atob(file.data);
           const bytes = new Uint8Array(binaryString.length);
           for (let i = 0; i < binaryString.length; i++) {
@@ -72,47 +59,62 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       userId: userId,
       fileCount: files.length,
       timestamp: new Date().toISOString(),
-      protection: "TimeChest Protected"
+      protection: "TimeChest AES-256 Protected",
+      note: "Este archivo está encriptado con AES-256"
     };
     zip.file('_metadata.json', JSON.stringify(metadata, null, 2));
 
-    // Generar ZIP
+    // Generar ZIP como ArrayBuffer
     console.log('Generating ZIP file...');
-    const zipBlob = await zip.generateAsync({
-      type: 'blob',
+    const zipArrayBuffer = await zip.generateAsync({
+      type: 'arraybuffer',
       compression: 'DEFLATE',
       compressionOptions: { level: 6 }
     });
 
-    console.log(`ZIP created: ${zipBlob.size} bytes`);
+    console.log(`ZIP created: ${zipArrayBuffer.byteLength} bytes`);
 
-    // Convertir a ArrayBuffer para Supabase
-    const arrayBuffer = await zipBlob.arrayBuffer();
+    // Paso 2: Encriptar el ZIP con AES
+    console.log('Encrypting ZIP with AES-256...');
     
-    // Crear nombre único
-    const timestamp = Date.now();
-    const zipFileName = `protected-${timestamp}.zip`;
-    const filePath = `${fullPath}/${zipFileName}`;
+    // Convertir ArrayBuffer a WordArray
+    const zipWordArray = CryptoJS.lib.WordArray.create(zipArrayBuffer);
+    
+    // Encriptar con AES
+    const encrypted = CryptoJS.AES.encrypt(zipWordArray, password, {
+      mode: CryptoJS.mode.CBC,
+      padding: CryptoJS.pad.Pkcs7
+    });
 
-    console.log(`Uploading to: ${filePath}`);
+    // Obtener el resultado encriptado como Base64
+    const encryptedBase64 = encrypted.toString();
+    
+    // Convertir Base64 a Buffer
+    const encryptedBuffer = Buffer.from(encryptedBase64, 'base64');
 
-    // Subir a Supabase (usando el mismo enfoque que tu otro proyecto)
+    console.log(`ZIP encrypted: ${encryptedBuffer.length} bytes`);
+
+    // Verificar/Crear carpeta del usuario
+    try {
+      await supabase.storage
+        .from(bucketName)
+        .upload(`${userFolder}/.keep`, new Blob([]), { upsert: true });
+    } catch (folderError) {
+      console.log('Folder check completed');
+    }
+
+    // Subir a Supabase (ENCRIPTADO)
+    console.log(`Uploading encrypted ZIP to: ${filePath}`);
     const { data, error } = await supabase.storage
       .from(bucketName)
-      .upload(filePath, arrayBuffer, {
+      .upload(filePath, encryptedBuffer, {
         upsert: false,
         cacheControl: '3600',
-        contentType: 'application/zip'
+        contentType: 'application/octet-stream'
       });
 
     if (error) {
       console.error('Supabase upload error:', error);
-      
-      // Si el error es que el bucket no existe, crear uno alternativo
-      if (error.message?.includes('bucket') || error.message?.includes('not found')) {
-        throw new Error('Storage bucket not found. Please create "llakaScriptBucket" in Supabase dashboard.');
-      }
-      
       throw new Error(`Upload failed: ${error.message}`);
     }
 
@@ -121,27 +123,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       .from(bucketName)
       .getPublicUrl(filePath);
 
-    console.log('Upload successful!');
+    console.log('Encrypted ZIP upload successful!');
 
     res.status(200).json({
       success: true,
-      message: 'Files compressed and uploaded successfully',
+      message: 'Files encrypted and compressed successfully',
       file: {
         name: zipFileName,
         url: urlData.publicUrl,
         path: filePath,
-        size: zipBlob.size,
-        fileCount: files.length
+        size: encryptedBuffer.length,
+        originalSize: zipArrayBuffer.byteLength,
+        fileCount: files.length,
+        encrypted: true,
+        encryptionMethod: 'AES-256'
       }
     });
 
   } catch (error: any) {
-    console.error('Error creating protected zip:', error);
+    console.error('Error creating encrypted zip:', error);
     
     res.status(500).json({
       success: false,
-      message: error.message || 'Failed to create protected zip',
-      details: process.env.NODE_ENV === 'development' ? 'Check Supabase bucket configuration' : undefined
+      message: error.message || 'Failed to create encrypted zip'
     });
   }
 }
